@@ -13,7 +13,7 @@ from scipy.interpolate import interp1d
 import math
 import json
 import warnings
-
+import time
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -37,23 +37,81 @@ def read(filepath, resample_hz='uniform'):
     p = pathlib.Path(filepath)
     ftype = p.suffixes[0].lower()
     fsize = round(p.stat().st_size / (1024 * 1024), 1)
+    # following csv part is hardcoded for NHANES 2011-2014 merged csv file
+    if ftype == ".csv":
+        hz = 80
+        dt = pd.Timedelta(milliseconds=1000 / hz)
 
-    if ftype in (".csv", ".pkl"):
-
-        if ftype == ".csv":
-            data = pd.read_csv(
-                filepath,
-                usecols=['time', 'x', 'y', 'z'],
-                parse_dates=['time'],
-                index_col='time'
-            )
-        elif ftype == ".pkl":
-            data = pd.read_pickle(filepath)
+        # ---- first chunk -> start_time ----
+        first_chunk = pd.read_csv(filepath, nrows=1000, usecols=[0, 1, 2, 3],
+                                  dtype={1: 'f4', 2: 'f4', 3: 'f4'})
+        ts0 = first_chunk.iloc[:, 0].astype(str)
+        malformed = ts0.str.match(r'^\d{1,2}-')
+        if malformed.any():
+            ts0.loc[malformed] = "2000-0" + ts0.loc[malformed]
+        parsed0 = pd.to_datetime(ts0, errors='coerce')
+        if parsed0.notna().any():
+            start_time = parsed0.dropna().iloc[0]
         else:
-            raise ValueError(f"Unknown file format: {ftype}")
+            start_time = pd.to_datetime('2000-01-03 12:30:00.000')
 
-        freq = infer_freq(data.index)
-        sample_rate = int(np.round(pd.Timedelta('1s') / freq))
+        # ---- stream read ----
+        chunk_size = 1_000_000
+        csv_iter = pd.read_csv(
+            filepath,
+            chunksize=chunk_size,
+            usecols=[0, 1, 2, 3],
+            dtype={1: 'f4', 2: 'f4', 3: 'f4'},
+            engine='c'
+        )
+
+        x_list, y_list, z_list, t_list = [], [], [], []
+        total_processed = 0
+
+        for df in csv_iter:
+            n = len(df)
+
+            ts = df.iloc[:, 0].astype(str)
+            malformed = ts.str.match(r'^\d{1,2}-')
+            if malformed.any():
+                ts.loc[malformed] = "2000-0" + ts.loc[malformed]
+
+            ts_parsed = pd.to_datetime(ts, errors='coerce')
+
+            # see NHANES 2011-2014 csv file format , orginal data is remapped to 1st wk of 2000
+            valid = ts_parsed.notna() & ts_parsed.dt.year.between(1999, 2001)
+            invalid = ~valid
+
+            if invalid.any():
+                exp_start = start_time + dt * total_processed
+                exp_ts = pd.date_range(exp_start, periods=n, freq=dt)
+                ts_parsed.loc[invalid] = exp_ts[invalid.to_numpy()]
+
+            t_list.append(ts_parsed.to_numpy('datetime64[ns]'))
+
+            arr = df.iloc[:, 1:4].to_numpy(dtype='f4', copy=False)
+            x_list.append(arr[:, 0])
+            y_list.append(arr[:, 1])
+            z_list.append(arr[:, 2])
+
+            total_processed += n
+
+        # ---- build frame once ----
+        idx = pd.DatetimeIndex(np.concatenate(t_list), name='time')
+        data = pd.DataFrame(
+            {'x': np.concatenate(x_list),
+             'y': np.concatenate(y_list),
+             'z': np.concatenate(z_list)},
+            index=idx
+        )
+
+        # clean up lists
+        del x_list, y_list, z_list, t_list
+
+        if len(data) > 1:
+            sample_rate = int(round(1.0 / (data.index[1] - data.index[0]).total_seconds()))
+        else:
+            sample_rate = hz
 
         data, info = actipy.process(
             data, sample_rate,
@@ -64,15 +122,39 @@ def read(filepath, resample_hz='uniform'):
         )
 
         info = {
-            **{"Filename": filepath,
-               "Device": ftype,
-               "Filesize(MB)": fsize,
-               "SampleRate": sample_rate},
+            "Filename": filepath,
+            "Device": ftype,
+            "Filesize(MB)": fsize,
+            "SampleRate": sample_rate,
+            **info
+        }
+
+    elif ftype == ".pkl":
+        data = pd.read_pickle(filepath)
+
+        if len(data.index) > 1:
+            sr = 1.0 / (data.index[1] - data.index[0]).total_seconds()
+            sample_rate = int(round(sr))
+        else:
+            sample_rate = None
+
+        data, info = actipy.process(
+            data, sample_rate,
+            lowpass_hz=20,
+            calibrate_gravity=True,
+            detect_nonwear=False,
+            resample_hz=resample_hz,
+        )
+
+        info = {
+            "Filename": filepath,
+            "Device": ftype,
+            "Filesize(MB)": fsize,
+            "SampleRate": sample_rate,
             **info
         }
 
     elif ftype in (".cwa", ".gt3x", ".bin"):
-
         data, info = actipy.read_device(
             filepath,
             lowpass_hz=15,
@@ -80,12 +162,13 @@ def read(filepath, resample_hz='uniform'):
             detect_nonwear=False,
             resample_hz=resample_hz,
         )
+    else:
+        raise ValueError(f"Unknown file format: {ftype}")
 
     if 'ResampleRate' not in info:
-        info['ResampleRate'] = info['SampleRate']
+        info['ResampleRate'] = info.get('SampleRate')
 
     data, info_nonwear = detect_nonwear(data)
-    print(info_nonwear)
     info.update(info_nonwear)
 
     return data, info
@@ -305,42 +388,27 @@ class EarlyStopping:
 
 
 def data_long2wide(X, times, non_wear):
-    """Convert long-format acc data to wide-format data.
-
-    Parameters
-    ----------
-    X : np.ndarray N x 3
-        Long-format data.
-    times: np.ndarray N x 1
-
-    Returns
-    -------
-    X : np.narray N x 3 x 900
-        Wide-format data.
-    times: np.ndarray N x 1
-    non_wear: np.ndarray N x 1
-    """
-    # get multiple of 900
-    remainder = X.shape[0] % 900
-    if remainder != 0:
-        X = X[:-remainder]
-        times = times[:-remainder]
-        non_wear = non_wear[:-remainder]
-
-    x = X[:, 0]
-    y = X[:, 1]
-    z = X[:, 2]
-
-    x = x.reshape(-1, 900)
-    y = y.reshape(-1, 900)
-    z = z.reshape(-1, 900)
-    times = times.reshape(-1, 900)
-    non_wear = non_wear.reshape(-1, 900)
-
-    X = np.stack((x, y, z), axis=1)
-    times = times[:, 0]
-    non_wear = non_wear[:, 0]
-    return X, times, non_wear
+    # how many complete 900-sample 
+    n_samples = len(X)
+    n_windows = n_samples // 900
+    
+    if n_windows == 0:
+        raise ValueError("Not enough data for even one 900-sample window")
+    # Truncate to exact multiple of 900
+    end_idx = n_windows * 900
+    # direct array slicing
+    X_truncated = X[:end_idx]
+    times_truncated = times[:end_idx] 
+    non_wear_truncated = non_wear[:end_idx]
+    # Reshape all at once
+    X_reshaped = X_truncated.reshape(n_windows, 900, 3)  # N x 900 x 3
+    X_transposed = X_reshaped.transpose(0, 2, 1)  # N x 3 x 900
+    
+    # Take every 900th timestamp (first of each window)
+    times_windows = times_truncated[::900]
+    non_wear_windows = non_wear_truncated[::900]
+    
+    return X_transposed, times_windows, non_wear_windows
 
 
 class cnnLSTMInFerDataset:
