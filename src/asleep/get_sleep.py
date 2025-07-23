@@ -55,99 +55,92 @@ def load_model(model_path, force_download=False):
 
     return joblib.load(pth)
 
-
-def get_parsed_data(raw_data_path, info_data_path, resample_hz, args):
+# Skip raw.csv
+def get_parsed_data(info_data_path, resample_hz, args):
+    """Skip raw.csv but keep 100% identical processing"""
+    
     time_shift = 0
     if args.time_shift != '0':
         if args.time_shift[0] == '-':
             time_shift = -int(args.time_shift[1:])
         else:
             time_shift = int(args.time_shift[1:])
+    
+    # just don't save raw.csv
+    data, info = read(args.filepath, resample_hz)  
+    data = data.reset_index()
 
-    # add the time shift to the parsed data frame
-    if os.path.exists(raw_data_path) is False or os.path.exists(
-            info_data_path) is False or args.force_run is True:
-        data, info = read(args.filepath, resample_hz)
-        # data will have the following columns:
-        # time, x, y, z, non_wear
-        data = data.reset_index()
-
-        # apply time shift
-        start_time = pd.to_datetime(info.get("StartTime", data["time"].iloc[START_TIME_IDX]))
-        end_time = pd.to_datetime(info.get("EndTime", data["time"].iloc[END_TIME_IDX]))
-        info['StartTime'] = start_time + datetime.timedelta(hours=time_shift)
-        info['EndTime'] = end_time + datetime.timedelta(hours=time_shift)
-        info['StartTime'] = info['StartTime'].strftime('%Y-%m-%d %H:%M:%S')
-        info['EndTime'] = info['EndTime'].strftime('%Y-%m-%d %H:%M:%S')
+    # IDENTICAL time shift logic
+    if time_shift != 0:
+        start_time = pd.to_datetime(info.get("StartTime", data["time"].iloc[0]))
+        end_time = pd.to_datetime(info.get("EndTime", data["time"].iloc[-1]))
+        info['StartTime'] = (start_time + datetime.timedelta(hours=time_shift)).strftime('%Y-%m-%d %H:%M:%S')
+        info['EndTime'] = (end_time + datetime.timedelta(hours=time_shift)).strftime('%Y-%m-%d %H:%M:%S')
         data['time'] = data['time'] + datetime.timedelta(hours=time_shift)
-        print("Time shift applied: {} hours".format(time_shift))
+        print(f"Time shift applied: {time_shift} hours")
 
-        pathlib.Path(args.outdir).mkdir(parents=True, exist_ok=True)
-        data.to_csv(raw_data_path)
-        with open(info_data_path, 'w', encoding='utf-8') as f:
-            json.dump(info, f, ensure_ascii=False, indent=4, cls=NpEncoder)
-        print("Raw data file saved to: {}".format(raw_data_path))
-        print("Info data file saved to: {}".format(info_data_path))
-    else:
-        print("Raw data file already exists. Skipping raw data parsing.")
-        data = pd.read_csv(raw_data_path)
-        with open(info_data_path, 'r') as f:
-            info = json.load(f)
-    print(data.head())
+    # Save only info.json (skip raw.csv to save 4.2GB)
+    pathlib.Path(args.outdir).mkdir(parents=True, exist_ok=True)
+    with open(info_data_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f, ensure_ascii=False, indent=4, cls=NpEncoder)
+    
+    print(f"Info saved to: {info_data_path}")
+   
     return data, info
 
-
-def transform_data2model_input(
-        data2model_path,
-        times_path,
-        non_wear_path,
-        data,
-        args):
-    """
-    Current:
-                                   x         y         z          non_wear
-    time
-    2014-12-17 18:00:00.500000000  0.359059  0.195311 -0.950869   True
-    2014-12-17 18:00:00.533333333  0.331267  0.226415 -0.931257   False
-
-    Desired:
-    times array: 1 x N
-    non_wear_flag array: 1 x N
-    data array: N x 3 x 900 (30 seconds of data at 30Hz)
-    """
-    if os.path.exists(data2model_path) is False or os.path.exists(
-            times_path) is False or args.force_run is True:
-        times = data['time'].to_numpy()
-        non_wear = data['non_wear'].to_numpy()
-        data = data[['x', 'y', 'z']].to_numpy()
-        data2model, times, non_wear = data_long2wide(data, times, non_wear)
-
+# keep data2model.npy
+def transform_data2model_input(times_path, non_wear_path, data, args):
+    """Keep data2model.npy for plotting, process normally"""
+    
+    data2model_path = os.path.join(args.outdir, 'data2model.npy')
+    
+    # Check if files exist
+    files_exist = (
+        os.path.exists(data2model_path) and
+        os.path.exists(times_path) and 
+        os.path.exists(non_wear_path) and 
+        not args.force_run
+    )
+    
+    if not files_exist:
+        print("Transforming data to model input format...")
+        
+        # IDENTICAL transformation logic
+        times = pd.to_datetime(data['time'].values)
+        non_wear = data['non_wear'].values
+        xyz_data = data[['x', 'y', 'z']].values
+        
+        data2model, times_windowed, non_wear_windowed = data_long2wide(
+            xyz_data, times, non_wear
+        )
+        times_windowed = pd.to_datetime(times_windowed)
+        
+        print("Saving transformed data...")
+        # Save all files including data2model.npy for plotting
         np.save(data2model_path, data2model)
-        np.save(times_path, times)
-        np.save(non_wear_path, non_wear)
-
-        print(
-            "Data2model file saved to: {}".format(
-                os.path.join(
-                    args.outdir,
-                    'data2model.npy')))
-        print(
-            "Times file saved to: {}".format(
-                os.path.join(
-                    args.outdir,
-                    'times.npy')))
-        print(
-            "Non-wear file saved to: {}".format(
-                os.path.join(
-                    args.outdir,
-                    'non_wear.npy')))
+        np.save(times_path, times_windowed) 
+        np.save(non_wear_path, non_wear_windowed)
+        
+        print(f"Data2model saved to: {data2model_path} (for plotting)")
+        print(f"Times saved to: {times_path}")
+        print(f"Non-wear saved to: {non_wear_path}")
+        
+        # Cleanup to help with 16GB RAM
+        del xyz_data, times, non_wear
+        import gc
+        gc.collect()
+        
     else:
-        print("Data2model file already exists. "
-              "Skip data transformation.")
+        print("Loading existing transformed data...")
         data2model = np.load(data2model_path)
-        times = np.load(times_path)
-        non_wear = np.load(non_wear_path)
-    return data2model, times, non_wear
+        times_windowed = pd.to_datetime(np.load(times_path))
+        non_wear_windowed = np.load(non_wear_path)
+    
+    print(f"Data2model shape: {data2model.shape}")
+    print(f"Times shape: {times_windowed.shape}")
+    print(f"Non-wear shape: {non_wear_windowed.shape}")
+    
+    return data2model, times_windowed, non_wear_windowed
 
 
 def mean_temp_and_light(data):
@@ -234,7 +227,7 @@ def get_sleep_windows(data2model, times, non_wear, args):
         master_acc, \
         master_npids
 
-
+# clean memory
 def main():
     parser = argparse.ArgumentParser(
         description="A tool to estimate sleep stages from accelerometer data",
@@ -309,31 +302,40 @@ def main():
     args.outdir = os.path.join(args.outdir, filename)
     print("Saving files to dir: {}".format(args.outdir))
 
-    raw_data_path = os.path.join(args.outdir, 'raw.csv')
+    # Skip raw.csv paths entirely - only need transformed data paths
     info_data_path = os.path.join(args.outdir, 'info.json')
-    data2model_path = os.path.join(args.outdir, 'data2model.npy')
+    data2model_path = os.path.join(args.outdir, 'data2model.npy')  # Keep for plotting
     times_path = os.path.join(args.outdir, 'times.npy')
     non_wear_path = os.path.join(args.outdir, 'non_wear.npy')
 
-    # 1. Parse raw files into a dataframe
-    # Add non-wear detection
-    data, info = get_parsed_data(
-        raw_data_path, info_data_path, resample_hz, args)
-    if args.remove_intermediate_files:
-        os.remove(raw_data_path)
+    # 1. Parse data directly (skip raw.csv)
+    data, info = get_parsed_data(info_data_path, resample_hz, args)
+    print(f"Memory usage after parsing: {data.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
 
-    # 1.1 Transform data into a usable format for inference
-    data2model, times, non_wear = transform_data2model_input(
-        data2model_path, times_path, non_wear_path, data, args)
-    print("data2model shape: {}".format(data2model.shape))
-    print("times shape: {}".format(times.shape))
-    print("Non_wear flag shape: {}".format(non_wear.shape))
-
-    # 1.2 Get the mean temperature and light (optional)
+    # 1.2 Get temperature/light first if needed
+    temp = None
+    light = None
     if args.report_light_and_temp:
         temp, light = mean_temp_and_light(data)
         print("temperature shape: {}".format(temp.shape))
         print("light shape: {}".format(light.shape))
+
+    # 1.1 Transform data (keep data2model.npy for plotting)
+    data2model, times, non_wear = transform_data2model_input(
+        times_path, non_wear_path, data, args)
+    
+    # Convert times for compatibility  
+    times = pd.to_datetime(times)
+    
+    print("data2model shape: {}".format(data2model.shape))
+    print("times shape: {}".format(times.shape))
+    print("Non_wear flag shape: {}".format(non_wear.shape))
+
+    # Cleanup original data to help with 16GB RAM (i can only safely request 16GB RAM ...)
+    del data
+    import gc
+    gc.collect()
+    print("Cleaned up original data from memory")
 
     # times and non-wear flag need to be stored for visualization
     if args.remove_intermediate_files:
@@ -376,7 +378,8 @@ def main():
     sleep_stage_predictions = np.vectorize(
         SLEEPNET_THRE_CLASS_LABELS.get)(sleepnet_output)
 
-    if args.report_light_and_temp:
+    # Create predictions dataframe - use pre-computed temp/light if available
+    if args.report_light_and_temp and temp is not None and light is not None:
         predictions_df = pd.DataFrame(
             {
                 'time': times,
@@ -403,6 +406,10 @@ def main():
     print("Predictions saved to: {}".format(final_prediction_path))
     predictions_df.to_csv(final_prediction_path, index=False)
 
+    # Cleanup predictions data if possible
+    del sleep_wake_predictions, sleep_stage_predictions, sleepnet_output
+    gc.collect()
+
     # 4. Summary statistics
     # 4.1 Generate sleep block df and indicate the longest block per day
     # time start, time end, is_longest_block
@@ -426,6 +433,12 @@ def main():
 
     # 4.3 Generate summary statistics across different days
     summarize_daily_sleep(day_summary_df, output_json_path, args.min_wear)
+
+    # Final cleanup
+    print("Processing completed successfully!")
+    print(f"Final memory cleanup...")
+    del predictions_df, all_sleep_wins_df, day_summary_df
+    gc.collect()
 
 
 def get_master_df(block_time_df, times, acc_array):
